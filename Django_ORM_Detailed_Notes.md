@@ -467,3 +467,111 @@ This gives each group its own `total_amount`, computed just for that group's exp
 - `list(queryset)`
 
 This "build vs ask" distinction is the core mental model for understanding *when* Django actually talks to the database — and it's the key to writing efficient, predictable ORM code.
+
+---
+
+## 18. Database Transactions (`transaction.atomic`)
+
+### What is a transaction?
+
+A **transaction** groups multiple database operations into a single, indivisible logical unit. "Indivisible" means the database treats the whole group as **one action** — either every operation inside it takes effect, or none of them do. There's no in-between state where only some of the operations happened.
+
+### The core rule
+
+- If **every** operation inside the transaction succeeds → **COMMIT** (all changes become permanent).
+- If **any** operation inside the transaction fails → **ROLLBACK** (all changes are undone, as if nothing happened).
+
+### Why this matters — the consistency problem
+
+Imagine creating an expense that must be split between multiple participants:
+
+```python
+expense = Expense.objects.create(...)
+ExpenseParticipant.objects.create(...)   # participant 1
+ExpenseParticipant.objects.create(...)   # participant 2  <- fails here
+```
+
+Without a transaction, here's what goes wrong: the `Expense` row and the *first* `ExpenseParticipant` row are already saved to the database by the time the second participant creation fails. Now you're left with:
+
+- An expense that exists.
+- Only **one** of its participants recorded.
+- No indication in the database that anything is wrong.
+
+This is called an **inconsistent state** — the data no longer accurately represents a valid real-world situation (an expense should always have all its participants, not a random subset). Bugs like this are especially dangerous because they don't throw an obvious error later — they just quietly corrupt your data.
+
+A transaction prevents this by treating "create the expense + create all its participants" as **one atomic operation**: either the whole thing lands in the database together, or none of it does.
+
+### Syntax
+
+```python
+from django.db import transaction
+
+with transaction.atomic():
+    expense = Expense.objects.create(...)
+    ExpenseParticipant.objects.create(...)
+    ExpenseParticipant.objects.create(...)
+```
+
+Everything inside the `with transaction.atomic():` block is treated as a single unit. If any line inside raises an exception, Django automatically discards all the database changes made by the earlier lines in that same block too — even the ones that "succeeded" individually.
+
+### Flow, step by step
+
+```
+BEGIN TRANSACTION
+   Query 1  (e.g., create expense)
+   Query 2  (e.g., create participant 1)
+   Query 3  (e.g., create participant 2)
+Did all queries succeed?
+   YES -> COMMIT   (all changes saved permanently, together)
+   NO  -> ROLLBACK (all changes undone, as if none of it ran)
+```
+
+Note that **BEGIN** doesn't mean data is saved yet — it means the database starts "tracking" a set of pending changes that are not yet final.
+
+### COMMIT
+
+COMMIT is the moment the database makes every change inside the block **permanent**. This only happens if the `atomic()` block runs to completion **without an unhandled exception**. Until COMMIT happens, none of the changes are visible outside the transaction (other parts of the application, or other users querying the database, will not see these half-finished changes).
+
+### ROLLBACK
+
+ROLLBACK is the opposite — it **undoes every single change** made inside the transaction block, as though none of those queries had ever run. This is triggered automatically the moment an exception occurs inside the `atomic()` block. It doesn't matter if 2 out of 3 operations already technically executed against the database — the database reverts all of them back to how things were before the transaction began.
+
+### Exception flow — what actually happens
+
+1. Code starts running inside `with transaction.atomic():`.
+2. Some line inside raises an exception (e.g., a validation error, a database constraint violation, a bug).
+3. Python immediately stops executing the rest of the `atomic()` block — later lines inside it never run.
+4. Django tells the database to **roll back** everything done so far in this transaction.
+5. The exception then **propagates upward** normally, just like any other Python exception.
+6. Code written *after* the `atomic()` block will **not execute**, unless you specifically catch the exception (e.g., with a `try/except` wrapping the block).
+
+```python
+try:
+    with transaction.atomic():
+        expense = Expense.objects.create(...)
+        ExpenseParticipant.objects.create(...)
+        raise ValueError("something went wrong")
+except ValueError:
+    print("Transaction rolled back, handled gracefully")
+```
+
+In this example, even though `expense` was technically inserted first, the raised `ValueError` inside the block causes Django to roll back *both* the expense creation and anything else attempted in that block — the `except` only catches the Python exception for your own error handling; it does **not** rescue the database changes.
+
+### Mental model
+
+Think of `transaction.atomic()` as a **temporary workspace** or a **draft**, not the real filing cabinet. Everything you do inside the block is written on a whiteboard first. Only when the whole block finishes successfully does Django "photograph the whiteboard and file it away permanently" (COMMIT). If anything interrupts you before you finish, the whiteboard just gets wiped clean (ROLLBACK) — nothing partial ever makes it into the permanent files.
+
+### Common real-world use cases
+
+- **Expense + participants** — an expense should never exist without its full list of participants.
+- **Orders + order items** — an order shouldn't be recorded if its line items fail to save.
+- **Bank transfers** — money must be deducted from one account **and** added to another; if only one side happens, money is destroyed or created out of nowhere.
+- **Inventory updates** — reducing stock in one place while recording a sale elsewhere; both must succeed together or neither should.
+
+### Interview / key talking points
+
+- Transactions **ensure database consistency** — the database never ends up in a state that represents "half" of a real operation.
+- They **prevent partial or incomplete data** from being saved when a multi-step operation fails partway through.
+- They **group multiple queries into one logical, all-or-nothing operation**.
+- **COMMIT** happens only after the entire `atomic()` block completes without error.
+- **Any uncaught exception inside the block automatically triggers a ROLLBACK** — you don't need to manually tell Django to roll back; it's automatic behavior tied to exceptions.
